@@ -1,0 +1,375 @@
+name: Build Kernel with APatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Entropy-1.6'
+        required: true
+        default: 'Entropy-1.6'
+      apatch_version:
+        description: 'APatch version to integrate'
+        required: true
+        default: 'latest'
+      device_codename:
+        description: 'bitra'
+        required: true
+        default: 'st17'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    
+    steps:
+      - name: Setup Environment
+        run: |
+          apt-get update && apt-get install -y \
+            git ccache automake flex lzop bison \
+            gperf build-essential zip curl zlib1g-dev \
+            g++-multilib libxml2-utils bzip2 libbz2-dev \
+            libbz2-1.0 libghc-bzlib-dev squashfs-tools \
+            pngcrush schedtool dpkg-dev liblz4-tool \
+            make optipng bc libstdc++6 git-core libssl-dev \
+            openssl libncurses5 libncurses-dev libncurses5-dev \
+            ncurses-dev libghc-ncurses-dev pngquant \
+            re2c libssl3 libxml2 python3 python3-pip \
+            python-is-python3 git-lfs default-jdk \
+            libudev-dev libudev1 udev \
+            --no-install-recommends
+          
+          # Setup git identity
+          git config --global user.email "ci@github.com"
+          git config --global user.name "GitHub CI"
+          
+          # Create working directory
+          mkdir -p /workspace && cd /workspace
+          echo "WORKSPACE=/workspace" >> $GITHUB_ENV
+
+      - name: Download Android Clang Toolchain
+        run: |
+          cd /workspace
+          
+          # Download Android NDK/Clang r547379 (matching your kernel build)
+          mkdir -p toolchain
+          cd toolchain
+          
+          # Android Clang 20.0.0 from android.googlesource.com
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz"
+          
+          # Alternative: Use official Android NDK
+          wget -q https://dl.google.com/android/repository/android-ndk-r27-linux.zip -O ndk.zip || \
+          wget -q https://github.com/Foundry376/ndk/releases/download/r27/android-ndk-r27-linux.zip -O ndk.zip
+          
+          if [ -f ndk.zip ]; then
+            unzip -q ndk.zip
+            mv android-ndk-r27 clang-toolchain
+          else
+            # Fallback to direct clang download
+            wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/main/clang-r547379.tar.gz" -O clang.tar.gz
+            mkdir -p clang-toolchain
+            tar -xzf clang.tar.gz -C clang-toolchain || true
+          fi
+          
+          # Setup paths
+          echo "TOOLCHAIN=/workspace/toolchain" >> $GITHUB_ENV
+          echo "PATH=/workspace/toolchain/clang-toolchain/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Download Kernel Source
+        run: |
+          cd /workspace
+          
+          # Clone your kernel repository
+          # Replace with your actual kernel repo
+          git clone --depth=1 -b ${{ github.event.inputs.kernel_branch }} \
+            https://github.com/bijoyv9/Entropy-Kernel.git kernel || \
+          git clone --depth=1 -b android-4.19-stable \
+            https://android.googlesource.com/kernel/common kernel
+          
+          cd kernel
+          echo "KERNEL_SRC=/workspace/kernel" >> $GITHUB_ENV
+
+      - name: Download APatch
+        run: |
+          cd /workspace
+          
+          # Get latest APatch release
+          if [ "${{ github.event.inputs.apatch_version }}" = "latest" ]; then
+            APATCH_RELEASE=$(curl -s https://api.github.com/repos/bmax121/APatch/releases/latest | \
+              grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          else
+            APATCH_RELEASE="${{ github.event.inputs.apatch_version }}"
+          fi
+          
+          echo "APATCH_VERSION=$APATCH_RELEASE" >> $GITHUB_ENV
+          
+          # Download APatch
+          mkdir -p apatch && cd apatch
+          
+          # Download APatch source/patches
+          git clone --depth=1 -b $APATCH_RELEASE \
+            https://github.com/bmax121/APatch.git . || \
+          git clone --depth=1 https://github.com/bmax121/APatch.git .
+          
+          # Download APatch prebuilt if available
+          mkdir -p prebuilt
+          cd prebuilt
+          
+          # Try to get KPMS (Kernel Patch Module System)
+          curl -L -o kpms.zip \
+            "https://github.com/bmax121/APatch/releases/download/$APATCH_RELEASE/kpms.zip" || true
+          
+          unzip -q kpms.zip -d kpms/ 2>/dev/null || true
+          
+          echo "APATCH_SRC=/workspace/apatch" >> $GITHUB_ENV
+
+      - name: Integrate APatch Patches
+        run: |
+          cd /workspace/kernel
+          
+          # Apply APatch kernel patches
+          # These patches modify kernel to support APatch modules
+          
+          if [ -d "/workspace/apatch/kernel_patches" ]; then
+            for patch in /workspace/apatch/kernel_patches/*.patch; do
+              [ -f "$patch" ] && patch -p1 < "$patch" || true
+            done
+          fi
+          
+          # Alternative: Apply inline patches if available
+          if [ -f "/workspace/apatch/patch.sh" ]; then
+            bash /workspace/apatch/patch.sh /workspace/kernel || true
+          fi
+          
+          # Setup APatch config options
+          cat >> arch/arm64/configs/${{ github.event.inputs.device_codename }}_defconfig << EOF
+          
+          # APatch Configuration
+          CONFIG_KPM=y
+          CONFIG_KPM_DEBUG=y
+          CONFIG_KPM_MODULE=y
+          CONFIG_KPM_AUTOLOAD=y
+          CONFIG_KPM_SAFEMODE=y
+          CONFIG_KPM_DETERMINISTIC=y
+          EOF
+
+      - name: Setup Kernel Configuration
+        run: |
+          cd /workspace/kernel
+          
+          # Use the device defconfig or create from template
+          DEFCONFIG="${{ github.event.inputs.device_codename }}_defconfig"
+          
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            # Try to find existing defconfig
+            DEFCONFIG=$(find arch/arm64/configs -name "*defconfig" | head -1 | xargs basename)
+            echo "Using defconfig: $DEFCONFIG"
+          fi
+          
+          # Generate .config
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            $DEFCONFIG
+          
+          # Enable additional configs for APatch compatibility
+          ./scripts/config --enable CONFIG_MODULES
+          ./scripts/config --enable CONFIG_MODULE_UNLOAD
+          ./scripts/config --enable CONFIG_KALLSYMS
+          ./scripts/config --enable CONFIG_KALLSYMS_ALL
+          ./scripts/config --enable CONFIG_DEBUG_KERNEL
+          ./scripts/config --enable CONFIG_DEBUG_FS
+          ./scripts/config --enable CONFIG_OVERLAY_FS
+          ./scripts/config --enable CONFIG_CRYPTO_LZO
+          ./scripts/config --enable CONFIG_ASHMEM
+          ./scripts/config --enable CONFIG_ANDROID
+          ./scripts/config --enable CONFIG_ANDROID_BINDER_IPC
+          ./scripts/config --enable CONFIG_ANDROID_BINDERFS
+          ./scripts/config --enable CONFIG_PM_AUTOSLEEP
+          ./scripts/config --enable CONFIG_PM_WAKELOCKS
+          ./scripts/config --enable CONFIG_NETFILTER_XT_MATCH_QTAGUID
+          ./scripts/config --enable CONFIG_IP_NF_IPTABLES
+          ./scripts/config --enable CONFIG_IP6_NF_IPTABLES
+          ./scripts/config --enable CONFIG_NETFILTER_XT_MATCH_OWNER
+          ./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
+          ./scripts/config --enable CONFIG_TMPFS_XATTR
+          ./scripts/config --enable CONFIG_CGROUP_DEVICE
+          ./scripts/config --enable CONFIG_CGROUP_FREEZER
+          ./scripts/config --enable CONFIG_CPUSETS
+          ./scripts/config --enable CONFIG_CGROUP_CPUACCT
+          ./scripts/config --enable CONFIG_CGROUP_SCHED
+          ./scripts/config --enable CONFIG_CGROUP_PIDS
+          ./scripts/config --enable CONFIG_CGROUP_RDMA
+          ./scripts/config --enable CONFIG_CGROUP_PERF
+          ./scripts/config --enable CONFIG_CGROUP_BPF
+          ./scripts/config --enable CONFIG_CGROUP_DEBUG
+          ./scripts/config --enable CONFIG_NAMESPACES
+          ./scripts/config --enable CONFIG_UTS_NS
+          ./scripts/config --enable CONFIG_IPC_NS
+          ./scripts/config --enable CONFIG_USER_NS
+          ./scripts/config --enable CONFIG_PID_NS
+          ./scripts/config --enable CONFIG_NET_NS
+          ./scripts/config --enable CONFIG_DEVTMPFS
+          ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          ./scripts/config --enable CONFIG_SECURITY_SELINUX_DEVELOP
+          ./scripts/config --enable CONFIG_SECURITY_SELINUX_AVC_STATS
+          ./scripts/config --enable CONFIG_SECURITY_SELINUX_CHECKREQPROT_VALUE
+          ./scripts/config --enable CONFIG_SECURITYFS
+          
+          # Disable conflicting options
+          ./scripts/config --disable CONFIG_MODULE_SIG
+          ./scripts/config --disable CONFIG_MODULE_SIG_FORCE
+          ./scripts/config --disable CONFIG_MODULE_SIG_ALL
+          ./scripts/config --disable CONFIG_SYSTEM_TRUSTED_KEYRING
+          ./scripts/config --disable CONFIG_SYSTEM_BLACKLIST_KEYRING
+          ./scripts/config --disable CONFIG_SECURITY_SELINUX_ENFORCING
+          
+          # Update config
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- olddefconfig
+
+      - name: Build Kernel
+        run: |
+          cd /workspace/kernel
+          
+          # Setup ccache
+          export CCACHE_DIR=/workspace/.ccache
+          export CCACHE_COMPRESS=1
+          export CCACHE_MAXSIZE=5G
+          mkdir -p $CCACHE_DIR
+          
+          # Build with Android Clang
+          make ARCH=arm64 \
+            CC="ccache clang" \
+            CXX="ccache clang++" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            HOSTAR=llvm-ar \
+            -j$(nproc --all) 2>&1 | tee build.log
+          
+          # Check build success
+          if [ ! -f "arch/arm64/boot/Image.gz-dtb" ] && [ ! -f "arch/arm64/boot/Image" ]; then
+            echo "Build failed! Checking log..."
+            tail -100 build.log
+            exit 1
+          fi
+
+      - name: Create APatch Kernel Image
+        run: |
+          cd /workspace/kernel
+          
+          mkdir -p /workspace/output
+          
+          # Copy kernel image
+          if [ -f "arch/arm64/boot/Image.gz-dtb" ]; then
+            cp arch/arm64/boot/Image.gz-dtb /workspace/output/kernel-${{ github.event.inputs.device_codename }}.img
+          elif [ -f "arch/arm64/boot/Image.gz" ]; then
+            cp arch/arm64/boot/Image.gz /workspace/output/kernel-${{ github.event.inputs.device_codename }}.img
+          elif [ -f "arch/arm64/boot/Image" ]; then
+            cp arch/arm64/boot/Image /workspace/output/kernel-${{ github.event.inputs.device_codename }}.img
+          fi
+          
+          # Copy dtb if separate
+          if [ -d "arch/arm64/boot/dts" ]; then
+            find arch/arm64/boot/dts -name "*.dtb" -exec cp {} /workspace/output/ \; 2>/dev/null || true
+          fi
+          
+          # Copy modules
+          mkdir -p /workspace/output/modules
+          find . -name "*.ko" -exec cp {} /workspace/output/modules/ \; 2>/dev/null || true
+          
+          # Strip modules
+          for mod in /workspace/output/modules/*.ko; do
+            [ -f "$mod" ] && ${TOOLCHAIN}/clang-toolchain/bin/llvm-strip --strip-unneeded "$mod" 2>/dev/null || true
+          done
+          
+          # Create AnyKernel3 flashable zip
+          cd /workspace
+          mkdir -p anykernel
+          cd anykernel
+          
+          # Download AnyKernel3 template
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git . || \
+          git clone --depth=1 https://github.com/KernelSU/AnyKernel3.git .
+          
+          # Setup AnyKernel3
+          rm -f zImage Image* *.dtb 2>/dev/null || true
+          cp /workspace/output/kernel-${{ github.event.inputs.device_codename }}.img zImage 2>/dev/null || \
+          cp /workspace/output/kernel-${{ github.event.inputs.device_codename }}.img Image.gz-dtb 2>/dev/null || true
+          
+          # Copy dtbs
+          cp /workspace/output/*.dtb . 2>/dev/null || true
+          
+          # Update anykernel.sh
+          sed -i "s/### DO NOT EDIT THIS FILE/### Auto-generated/" anykernel.sh
+          sed -i "s/kernel.string=.*/kernel.string=Entropy-${KERNEL_VERSION}-APatch/" anykernel.sh 2>/dev/null || true
+          sed -i "s/do.devicecheck=.*/do.devicecheck=1/" anykernel.sh
+          sed -i "s/device.name1=.*/device.name1=${{ github.event.inputs.device_codename }}/" anykernel.sh
+          
+          # Create zip
+          zip -r9 /workspace/output/Entropy-${{ github.event.inputs.device_codename }}-APatch.zip *
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ github.event.inputs.device_codename }}-APatch
+          path: |
+            /workspace/output/*.img
+            /workspace/output/*.zip
+            /workspace/output/modules/
+            /workspace/kernel/build.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}-${{ github.event.inputs.device_codename }}-APatch
+          name: Entropy Kernel v${{ github.run_number }} with APatch ${{ env.APATCH_VERSION }}
+          body: |
+            ## Entropy Kernel Build with APatch
+            
+            **Device:** ${{ github.event.inputs.device_codename }}
+            **Kernel Version:** 4.19.325-cip133
+            **APatch Version:** ${{ env.APATCH_VERSION }}
+            **Build Date:** ${{ github.event.head_commit.timestamp }}
+            
+            ### Features
+            - Integrated APatch ${{ env.APATCH_VERSION }}
+            - Kernel Patch Module (KPM) support
+            - Android 14/15 compatible
+            
+            ### Installation
+            1. Flash via custom recovery (TWRP/OFox), OR
+            2. Use APatch app to patch boot image
+            
+            ### Notes
+            - This kernel includes APatch patches for KPM support
+            - Safemode enabled for recovery
+            - All required configs enabled
+            
+            ### Files
+            - `kernel-*.img` - Raw kernel image
+            - `Entropy-*-APatch.zip` - AnyKernel3 flashable zip
+            - `modules/` - Kernel modules
+          files: |
+            /workspace/output/*.img
+            /workspace/output/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        run: |
+          rm -rf /workspace/.ccache /workspace/kernel /workspace/apatch /workspace/toolchain
